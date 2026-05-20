@@ -11,7 +11,7 @@ const twilio = require("twilio");
 const { OpenAI } = require("openai");
 const axios = require("axios");
 
-const app = express();
+const app = express()
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
@@ -424,13 +424,16 @@ app.post("/voice/incoming", (req, res) => {
   const callSid = req.body.CallSid;
   const callerNumber = req.body.From;
 
-  // Start a new session for this call
-  callSessions[callSid] = {
-    messages: [{ role: "system", content: SYSTEM_PROMPT }],
-    callerNumber: callerNumber,
-    callerName: null,
-    startTime: new Date(),
-  };
+  // Only create a new session if one doesn't already exist (prevents overwriting on redirect)
+  if (!callSessions[callSid]) {
+    callSessions[callSid] = {
+      messages: [{ role: "system", content: SYSTEM_PROMPT }],
+      callerNumber: callerNumber,
+      callerName: null,
+      startTime: new Date(),
+      greetingPlayed: false,
+    };
+  }
 
   const VoiceResponse = twilio.twiml.VoiceResponse;
   const twiml = new VoiceResponse();
@@ -438,7 +441,8 @@ app.post("/voice/incoming", (req, res) => {
   // Opening greeting with consent
   const gather = twiml.gather({
     input: "speech",
-    speechTimeout: "auto",
+    timeout: 5,
+    speechTimeout: 3,
     action: "/voice/respond",
     language: "en-GB",
     speechModel: "experimental_conversations",
@@ -451,12 +455,74 @@ app.post("/voice/incoming", (req, res) => {
       "How can I help you today?"
   );
 
-  // If no speech detected, retry
+  callSessions[callSid].greetingPlayed = true;
+
+  // If no speech detected, go to /voice/gather (NOT back here — avoids replaying greeting)
   twiml.say(
     { voice: "Google.en-GB-Wavenet-B" },
     "Sorry, I didn't catch that. Could you please repeat?"
   );
-  twiml.redirect("/voice/incoming");
+  twiml.redirect("/voice/gather");
+
+  res.type("text/xml").send(twiml.toString());
+});
+
+// ============================================
+// ROUTE 1b: Re-gather speech without replaying the full greeting
+// ============================================
+app.post("/voice/gather", (req, res) => {
+  const callSid = req.body.CallSid;
+
+  // Safety: ensure session exists
+  if (!callSessions[callSid]) {
+    callSessions[callSid] = {
+      messages: [{ role: "system", content: SYSTEM_PROMPT }],
+      callerNumber: req.body.From,
+      callerName: null,
+      startTime: new Date(),
+      greetingPlayed: true,
+    };
+  }
+
+  const session = callSessions[callSid];
+  session.gatherRetries = (session.gatherRetries || 0) + 1;
+
+  const VoiceResponse = twilio.twiml.VoiceResponse;
+  const twiml = new VoiceResponse();
+
+  // After 3 retries with no speech at all, offer SMS and hang up
+  if (session.gatherRetries >= 3) {
+    twiml.say(
+      { voice: "Google.en-GB-Wavenet-B" },
+      "I'm having trouble hearing you. Let me send you a text with our details " +
+        "so you can get in touch at your convenience. Have a lovely day!"
+    );
+    sendBookingSMS(session.callerNumber);
+    twiml.hangup();
+    res.type("text/xml").send(twiml.toString());
+    return;
+  }
+
+  const gather = twiml.gather({
+    input: "speech",
+    timeout: 5,
+    speechTimeout: 3,
+    action: "/voice/respond",
+    language: "en-GB",
+    speechModel: "experimental_conversations",
+  });
+
+  gather.say(
+    { voice: "Google.en-GB-Wavenet-B" },
+    "I'm still here. Go ahead, I'm listening."
+  );
+
+  // If still no speech, loop back here (not to /voice/incoming)
+  twiml.say(
+    { voice: "Google.en-GB-Wavenet-B" },
+    "Sorry, I still can't hear you."
+  );
+  twiml.redirect("/voice/gather");
 
   res.type("text/xml").send(twiml.toString());
 });
@@ -500,7 +566,8 @@ app.post("/voice/respond", async (req, res) => {
     } else {
       const gather = twiml.gather({
         input: "speech",
-        speechTimeout: "auto",
+        timeout: 5,
+        speechTimeout: 3,
         action: "/voice/respond",
         language: "en-GB",
         speechModel: "experimental_conversations",
@@ -569,7 +636,8 @@ app.post("/voice/respond", async (req, res) => {
 
       const gather = twiml.gather({
         input: "speech",
-        speechTimeout: "auto",
+        timeout: 5,
+        speechTimeout: 3,
         action: "/voice/respond",
         language: "en-GB",
         speechModel: "experimental_conversations",
@@ -587,7 +655,8 @@ app.post("/voice/respond", async (req, res) => {
       twiml.say({ voice: "Google.en-GB-Wavenet-B" }, cleanReply);
       const gather = twiml.gather({
         input: "speech",
-        speechTimeout: "auto",
+        timeout: 5,
+        speechTimeout: 3,
         action: "/voice/respond",
         language: "en-GB",
         speechModel: "experimental_conversations",
@@ -600,19 +669,20 @@ app.post("/voice/respond", async (req, res) => {
     // NORMAL RESPONSE - Continue conversation
     const gather = twiml.gather({
       input: "speech",
-      speechTimeout: "auto",
+      timeout: 5,
+      speechTimeout: 3,
       action: "/voice/respond",
       language: "en-GB",
       speechModel: "experimental_conversations",
     });
     gather.say({ voice: "Google.en-GB-Wavenet-B" }, agentReply);
 
-    // Fallback if no speech
+    // Fallback if no speech — go to /voice/gather (NOT back to /voice/respond without speech data)
     twiml.say(
       { voice: "Google.en-GB-Wavenet-B" },
       "Are you still there? If you need more time, just let me know."
     );
-    twiml.redirect("/voice/respond");
+    twiml.redirect("/voice/gather");
   } catch (error) {
     console.error("AI Error:", error.message);
     twiml.say(
