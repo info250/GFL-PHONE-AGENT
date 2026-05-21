@@ -11,7 +11,7 @@ const twilio = require("twilio");
 const { OpenAI } = require("openai");
 const axios = require("axios");
 
-const app = express()
+const app = express();
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
@@ -24,6 +24,9 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 // --- In-memory call state (stores conversation per call) ---
 const callSessions = {};
+
+// --- Max conversation turns to keep (prevents slow responses from growing context) ---
+const MAX_HISTORY_TURNS = 20; // keep last 20 messages + system prompt
 
 // --- AI System Prompt (the agent's personality, rules, and knowledge base) ---
 const SYSTEM_PROMPT = `You are Alex, a friendly and professional AI phone assistant for GFL Real Estate. You are male. You are the FIRST point of contact and your job is to HELP callers yourself — like a knowledgeable human agent available 24/7.
@@ -360,9 +363,9 @@ GFL complies with GDPR and the Data Protection Act 2018. We collect personal dat
 J5 — COMPLIANCE DISCLAIMERS
 Important: (1) GFL does not provide legal, tax, or financial advice. We always recommend consulting a qualified solicitor, accountant, or financial advisor. (2) Property values can go down as well as up. (3) Rental yields are estimates and not guaranteed. (4) Information provided is for general guidance only and may not reflect the very latest regulations. (5) GFL is an estate agency, not a law firm or financial advisory. When in doubt, recommend professional advice.
 
-====================
+=====================
 RULES FOR ALEX
-====================
+=====================
 
 CALL FLOW - FOLLOW THIS ORDER:
 1. Greet the caller warmly and mention call recording
@@ -387,7 +390,8 @@ RULES:
 10. If the caller wants to cancel a viewing, respond with EXACTLY: [CANCEL_VIEWING] after confirming
 11. If the caller wants to reschedule, respond with EXACTLY: [RESCHEDULE_VIEWING] after getting new date/time
 12. When a booking is confirmed, respond with EXACTLY: [BOOK_VIEWING] followed by the details
-13. Keep responses under 3 sentences — people do not like long speeches on the phone
+23. MESSAGE-TAKING: If a caller wants to leave a message for the team, collect: (a) their full name, (b) phone number, (c) what the message is about. Read the message back to confirm it is correct. Then respond with EXACTLY: [TAKE_MESSAGE] followed by "Name: [name] | Phone: [number] | Message: [their message]". Tell them the message will be passed on right away.
+13. CRITICAL — Keep responses to 1-2 SHORT sentences MAX. Never give long speeches. If someone asks a big question, give a brief answer and ask if they want more detail. Speed matters — callers hate waiting
 14. If you cannot understand after 3 tries, offer to send an SMS booking link
 15. NEVER transfer a call unless the caller explicitly demands to speak to a human — always try to help first
 16. You can quote prices in both GBP and USD for Caribbean properties
@@ -424,16 +428,13 @@ app.post("/voice/incoming", (req, res) => {
   const callSid = req.body.CallSid;
   const callerNumber = req.body.From;
 
-  // Only create a new session if one doesn't already exist (prevents overwriting on redirect)
-  if (!callSessions[callSid]) {
-    callSessions[callSid] = {
-      messages: [{ role: "system", content: SYSTEM_PROMPT }],
-      callerNumber: callerNumber,
-      callerName: null,
-      startTime: new Date(),
-      greetingPlayed: false,
-    };
-  }
+  // Start a new session for this call
+  callSessions[callSid] = {
+    messages: [{ role: "system", content: SYSTEM_PROMPT }],
+    callerNumber: callerNumber,
+    callerName: null,
+    startTime: new Date(),
+  };
 
   const VoiceResponse = twilio.twiml.VoiceResponse;
   const twiml = new VoiceResponse();
@@ -441,8 +442,7 @@ app.post("/voice/incoming", (req, res) => {
   // Opening greeting with consent
   const gather = twiml.gather({
     input: "speech",
-    timeout: 5,
-    speechTimeout: 3,
+    speechTimeout: "3",
     action: "/voice/respond",
     language: "en-GB",
     speechModel: "experimental_conversations",
@@ -455,81 +455,19 @@ app.post("/voice/incoming", (req, res) => {
       "How can I help you today?"
   );
 
-  callSessions[callSid].greetingPlayed = true;
-
-  // If no speech detected, go to /voice/gather (NOT back here — avoids replaying greeting)
+  // If no speech detected, retry
   twiml.say(
     { voice: "Google.en-GB-Wavenet-B" },
     "Sorry, I didn't catch that. Could you please repeat?"
   );
-  twiml.redirect("/voice/gather");
-
-  res.type("text/xml").send(twiml.toString());
-});
-
-// ============================================
-// ROUTE 1b: Re-gather speech without replaying the full greeting
-// ============================================
-app.post("/voice/gather", (req, res) => {
-  const callSid = req.body.CallSid;
-
-  // Safety: ensure session exists
-  if (!callSessions[callSid]) {
-    callSessions[callSid] = {
-      messages: [{ role: "system", content: SYSTEM_PROMPT }],
-      callerNumber: req.body.From,
-      callerName: null,
-      startTime: new Date(),
-      greetingPlayed: true,
-    };
-  }
-
-  const session = callSessions[callSid];
-  session.gatherRetries = (session.gatherRetries || 0) + 1;
-
-  const VoiceResponse = twilio.twiml.VoiceResponse;
-  const twiml = new VoiceResponse();
-
-  // After 3 retries with no speech at all, offer SMS and hang up
-  if (session.gatherRetries >= 3) {
-    twiml.say(
-      { voice: "Google.en-GB-Wavenet-B" },
-      "I'm having trouble hearing you. Let me send you a text with our details " +
-        "so you can get in touch at your convenience. Have a lovely day!"
-    );
-    sendBookingSMS(session.callerNumber);
-    twiml.hangup();
-    res.type("text/xml").send(twiml.toString());
-    return;
-  }
-
-  const gather = twiml.gather({
-    input: "speech",
-    timeout: 5,
-    speechTimeout: 3,
-    action: "/voice/respond",
-    language: "en-GB",
-    speechModel: "experimental_conversations",
-  });
-
-  gather.say(
-    { voice: "Google.en-GB-Wavenet-B" },
-    "I'm still here. Go ahead, I'm listening."
-  );
-
-  // If still no speech, loop back here (not to /voice/incoming)
-  twiml.say(
-    { voice: "Google.en-GB-Wavenet-B" },
-    "Sorry, I still can't hear you."
-  );
-  twiml.redirect("/voice/gather");
+  twiml.redirect("/voice/incoming");
 
   res.type("text/xml").send(twiml.toString());
 });
 
 // ============================================
 // ROUTE 2: Process caller's speech and respond
-// ============================================
+// =======================================================================
 app.post("/voice/respond", async (req, res) => {
   const callSid = req.body.CallSid;
   const transcript = req.body.SpeechResult;
@@ -549,8 +487,11 @@ app.post("/voice/respond", async (req, res) => {
 
   const session = callSessions[callSid];
 
+  // Log what Twilio heard (helps debug "not listening" issues)
+  console.log(`[${callSid}] Heard: "${transcript}" (confidence: ${confidence})`);
+
   // If we couldn't understand them (low confidence)
-  if (!transcript || confidence < 0.3) {
+  if (!transcript || parseFloat(confidence) < 0.4) {
     session.failCount = (session.failCount || 0) + 1;
 
     if (session.failCount >= 3) {
@@ -566,8 +507,7 @@ app.post("/voice/respond", async (req, res) => {
     } else {
       const gather = twiml.gather({
         input: "speech",
-        timeout: 5,
-        speechTimeout: 3,
+        speechTimeout: "3",
         action: "/voice/respond",
         language: "en-GB",
         speechModel: "experimental_conversations",
@@ -589,12 +529,20 @@ app.post("/voice/respond", async (req, res) => {
   session.messages.push({ role: "user", content: transcript });
 
   try {
+    // Trim conversation history to prevent slow responses from growing context
+    // Keep system prompt (index 0) + last MAX_HISTORY_TURNS messages
+    if (session.messages.length > MAX_HISTORY_TURNS + 1) {
+      const systemMsg = session.messages[0];
+      const recentMsgs = session.messages.slice(-(MAX_HISTORY_TURNS));
+      session.messages = [systemMsg, ...recentMsgs];
+    }
+
     // Send to OpenAI for AI response
     const aiResponse = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       messages: session.messages,
-      max_tokens: 250,
-      temperature: 0.7,
+      max_tokens: 200,
+      temperature: 0.4,
     });
 
     const agentReply = aiResponse.choices[0].message.content;
@@ -636,8 +584,7 @@ app.post("/voice/respond", async (req, res) => {
 
       const gather = twiml.gather({
         input: "speech",
-        timeout: 5,
-        speechTimeout: 3,
+        speechTimeout: "3",
         action: "/voice/respond",
         language: "en-GB",
         speechModel: "experimental_conversations",
@@ -655,8 +602,7 @@ app.post("/voice/respond", async (req, res) => {
       twiml.say({ voice: "Google.en-GB-Wavenet-B" }, cleanReply);
       const gather = twiml.gather({
         input: "speech",
-        timeout: 5,
-        speechTimeout: 3,
+        speechTimeout: "3",
         action: "/voice/respond",
         language: "en-GB",
         speechModel: "experimental_conversations",
@@ -666,23 +612,47 @@ app.post("/voice/respond", async (req, res) => {
       return;
     }
 
+    // TAKE MESSAGE
+    if (agentReply.includes("[TAKE_MESSAGE]")) {
+      const cleanReply = agentReply.replace("[TAKE_MESSAGE]", "").trim();
+      twiml.say({ voice: "Google.en-GB-Wavenet-B" }, cleanReply);
+
+      // Send the message to the GFL team via SMS
+      sendMessageNotification(session.callerNumber, cleanReply);
+
+      const gather = twiml.gather({
+        input: "speech",
+        speechTimeout: "3",
+        action: "/voice/respond",
+        language: "en-GB",
+        speechModel: "experimental_conversations",
+      });
+      gather.say(
+        { voice: "Google.en-GB-Wavenet-B" },
+        "Your message has been passed on. Is there anything else I can help you with?"
+      );
+
+      res.type("text/xml").send(twiml.toString());
+      logCall(callSid, session, "message_taken");
+      return;
+    }
+
     // NORMAL RESPONSE - Continue conversation
     const gather = twiml.gather({
       input: "speech",
-      timeout: 5,
-      speechTimeout: 3,
+      speechTimeout: "3",
       action: "/voice/respond",
       language: "en-GB",
       speechModel: "experimental_conversations",
     });
     gather.say({ voice: "Google.en-GB-Wavenet-B" }, agentReply);
 
-    // Fallback if no speech — go to /voice/gather (NOT back to /voice/respond without speech data)
+    // Fallback if no speech
     twiml.say(
       { voice: "Google.en-GB-Wavenet-B" },
       "Are you still there? If you need more time, just let me know."
     );
-    twiml.redirect("/voice/gather");
+    twiml.redirect("/voice/respond");
   } catch (error) {
     console.error("AI Error:", error.message);
     twiml.say(
@@ -763,6 +733,34 @@ async function sendConfirmationSMS(phoneNumber, details) {
 }
 
 // ============================================
+// HELPER: Send message notification to GFL team
+// ============================================
+async function sendMessageNotification(callerNumber, messageDetails) {
+  try {
+    // Send SMS to the GFL team number with the caller's message
+    const teamNumber = process.env.HUMAN_AGENT_NUMBER;
+    if (teamNumber) {
+      await twilioClient.messages.create({
+        to: teamNumber,
+        from: process.env.TWILIO_PHONE_NUMBER,
+        body: `NEW MESSAGE via Alex (AI Agent):\nFrom: ${callerNumber}\n${messageDetails}\n\nPlease call back at your earliest convenience.`,
+      });
+      console.log(`Message notification sent to team for caller ${callerNumber}`);
+    }
+
+    // Also send confirmation to the caller
+    await twilioClient.messages.create({
+      to: callerNumber,
+      from: process.env.TWILIO_PHONE_NUMBER,
+      body: `Hi! Thanks for your message to GFL Real Estate. Our team has received it and will get back to you as soon as possible. - GFL Real Estate`,
+    });
+    console.log(`Message confirmation SMS sent to ${callerNumber}`);
+  } catch (err) {
+    console.error("Message Notification Error:", err.message);
+  }
+}
+
+// ============================================
 // HELPER: Create lead in HubSpot
 // ============================================
 async function createHubSpotLead(session) {
@@ -822,6 +820,6 @@ app.listen(PORT, () => {
   - GET  /health          → Health check
 
   Ready to answer calls!
-  ===========================================
+  ============================================
   `);
 });
